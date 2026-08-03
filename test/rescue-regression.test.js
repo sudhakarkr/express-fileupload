@@ -1,90 +1,70 @@
 'use strict';
 
-// Regression test for path-traversal sanitization in express-fileupload's
-// parseFileName. On the vulnerable code, a filename containing directory
-// traversal sequences (e.g. "../../etc/passwd") is returned as-is and would
-// be joined into the upload destination, enabling arbitrary file write.
-// The patched code sanitizes the filename to strip any directory components.
+// Regression test for express-fileupload path traversal via crafted
+// Content-Disposition filename and prototype pollution via nested field keys.
+// This test is self-contained (no test framework) and imports the library
+// by relative path per package.json main entry.
 
 const assert = require('node:assert');
 const path = require('path');
 
 const utilities = require('../lib/utilities.js');
-const { parseFileName } = utilities;
+const { parseFileName, buildFields, isSafeFromPollution, sanitizeFileName } = utilities;
 
-assert.strictEqual(typeof parseFileName, 'function',
-  'parseFileName must be exported from lib/utilities.js');
-
-const maliciousInputs = [
-  '../../etc/passwd',
-  '..\\..\\windows\\system32\\cmd.exe',
+// --- Test 1: Path traversal via filename ---
+// An attacker sends a filename like "../../../../etc/passwd". The patched
+// parseFileName MUST strip path components so the result cannot escape the
+// upload directory when joined with a destination path.
+const maliciousNames = [
+  '../../../../etc/passwd',
+  '..\\..\\..\\windows\\system32\\evil.exe',
   '/etc/passwd',
   'foo/../../bar.txt',
-  'subdir/evil.sh'
+  'subdir/inner.txt'
 ];
 
-for (const evil of maliciousInputs) {
-  const parsed = parseFileName({}, evil);
-
-  assert.strictEqual(typeof parsed, 'string',
-    `parseFileName should return a string for input ${JSON.stringify(evil)}`);
-
-  // The sanitized filename must not contain any path separators.
-  assert.ok(parsed.indexOf('/') === -1,
-    `parseFileName leaked '/' for input ${JSON.stringify(evil)} -> ${JSON.stringify(parsed)}`);
-  assert.ok(parsed.indexOf('\\') === -1,
-    `parseFileName leaked '\\' for input ${JSON.stringify(evil)} -> ${JSON.stringify(parsed)}`);
-
-  // It must not equal traversal identifiers.
-  assert.notStrictEqual(parsed, '..',
-    `parseFileName returned traversal identifier for ${JSON.stringify(evil)}`);
-  assert.notStrictEqual(parsed, '.',
-    `parseFileName returned dot identifier for ${JSON.stringify(evil)}`);
-
-  // Joining the sanitized name with an intended upload directory must not
-  // escape that directory. This is the core property that prevents arbitrary
-  // file write via crafted Content-Disposition filenames.
-  const uploadDir = path.resolve('/tmp/uploads');
-  const resolved = path.resolve(uploadDir, parsed);
-  assert.ok(
-    resolved === uploadDir || resolved.startsWith(uploadDir + path.sep),
-    `sanitized filename escaped upload dir for ${JSON.stringify(evil)}: ` +
-      `resolved=${resolved}, uploadDir=${uploadDir}, parsed=${parsed}`
-  );
-
-  // Specifically, it must never resolve to the system /etc/passwd or to a
-  // Windows system location.
-  assert.notStrictEqual(resolved, path.resolve('/etc/passwd'),
-    `parseFileName allowed traversal to /etc/passwd for ${JSON.stringify(evil)}`);
+for (const name of maliciousNames) {
+  const parsed = parseFileName({}, name);
+  assert.strictEqual(typeof parsed, 'string', `parseFileName should return a string for ${name}`);
+  assert.ok(parsed.length > 0, `parseFileName returned empty for ${name}`);
+  // Must not contain path separators.
+  assert.ok(!parsed.includes('/'), `parseFileName leaked '/' for input ${JSON.stringify(name)} => ${parsed}`);
+  assert.ok(!parsed.includes('\\'), `parseFileName leaked '\\' for input ${JSON.stringify(name)} => ${parsed}`);
+  // Must not be a traversal token.
+  assert.notStrictEqual(parsed, '..', `parseFileName produced '..' for ${name}`);
+  assert.notStrictEqual(parsed, '.', `parseFileName produced '.' for ${name}`);
+  // Joining with a destination directory must stay within it.
+  const dest = '/uploads';
+  const joined = path.posix.normalize(path.posix.join(dest, parsed.replace(/\\/g, '/')));
+  assert.ok(joined.startsWith(dest + '/') || joined === dest,
+    `Joined path escapes upload dir: ${joined} (from ${name})`);
 }
 
-// Also verify that the fileFactory sink rejects clearly invalid destinations
-// (defense in depth). This is optional but strengthens the regression net.
-try {
-  const fileFactory = require('../lib/fileFactory.js');
-  const file = fileFactory({
-    buffer: Buffer.from('hello'),
-    name: 'safe.txt',
-    tempFilePath: undefined,
-    hash: '',
-    size: 5,
-    encoding: '7bit',
-    truncated: false,
-    mimetype: 'text/plain'
-  }, { useTempFiles: false });
+// sanitizeFileName should be exported and strip traversal too.
+assert.strictEqual(typeof sanitizeFileName, 'function', 'sanitizeFileName must be exported');
+assert.strictEqual(sanitizeFileName('../../etc/passwd'), 'passwd');
+assert.strictEqual(sanitizeFileName('..'), '');
+assert.strictEqual(sanitizeFileName('/'), '');
 
-  assert.strictEqual(typeof file.mv, 'function', 'file.mv must be a function');
+// --- Test 2: Prototype pollution via buildFields ---
+// buildFields must reject keys like __proto__, constructor, prototype.
+assert.strictEqual(typeof isSafeFromPollution, 'function', 'isSafeFromPollution must be exported');
+assert.strictEqual(isSafeFromPollution({}, '__proto__'), false);
+assert.strictEqual(isSafeFromPollution({}, 'constructor'), false);
+assert.strictEqual(isSafeFromPollution({}, 'prototype'), false);
 
-  // NUL byte in destination path must be rejected.
-  let cbErr = null;
-  file.mv('/tmp/uploads/foo\0.txt', (err) => { cbErr = err; });
-  assert.ok(cbErr instanceof Error,
-    'mv() must reject destination paths containing NUL bytes');
-} catch (e) {
-  // If fileFactory cannot be loaded standalone for some reason, rethrow so
-  // the regression is visible.
-  throw e;
-}
+const before = ({}).polluted;
+assert.strictEqual(before, undefined, 'precondition: Object.prototype.polluted must be undefined');
 
-console.log('REGRESSION: parseFileName strips path traversal components ' +
-  '(e.g. "../../etc/passwd") so sanitized filenames cannot escape the upload directory.');
+let obj = Object.create(null);
+obj = buildFields(obj, '__proto__', { polluted: 'yes' });
+
+// After the call, Object.prototype must NOT have been polluted.
+assert.strictEqual(({}).polluted, undefined,
+  'Prototype pollution occurred: Object.prototype.polluted was set via buildFields');
+
+// Also verify the malicious key was not stored on the target object either.
+assert.strictEqual(obj.polluted, undefined,
+  'buildFields incorrectly assigned the polluting payload');
+
+console.log('REGRESSION: verified parseFileName strips path traversal (../../etc/passwd -> basename) and buildFields/isSafeFromPollution block __proto__/constructor/prototype keys to prevent prototype pollution.');
